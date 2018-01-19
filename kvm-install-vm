@@ -192,6 +192,20 @@ function delete_vm ()
         output "Domain ${VMNAME} does not exist"
     fi
 
+    if $USE_LVM; then
+
+        if [ "${VERBOSE}" -eq 1 ]
+        then
+            output "Removing Logical Volume with the following command"
+            printf "    lvremove ${VOLGROUP}/${VMNAME} \\ \n"
+        else
+            outputn "Removeing Logical Volume"
+        fi
+        (lvremove ${VOLGROUP}/${VMNAME} && ok) \
+          || die "Could not remove Logical volume."
+
+    fi
+
     if [ "${STORPOOL_EXISTS}" -eq 1 ]
     then
         outputn "Destroying ${VMNAME} storage pool"
@@ -199,6 +213,7 @@ function delete_vm ()
     else
         output "Storage pool ${VMNAME} does not exist"
     fi
+
 }
 
 function fetch_images ()
@@ -399,26 +414,34 @@ ssh_authorized_keys:
 
 timezone: ${TIMEZONE}
 
+system_info:
+   default_user:
+    name: ${LOGIN_USER}
+    home: /home/${LOGIN_USER}
+    shell: /bin/bash
+    lock_passwd: True
+    groups: ['${SUDOGROUP}']
+    ssh-authorized-keys:
+      - ${KEY}
+
+write_files:
+  - path: /etc/puppetlabs/facter/facts.d/facts.txt
+    content: |
+      env=dev
+      role=${VMNAME}
+      location=home
+
 # Remove cloud-init when finished with it
 runcmd:
-  - ${NETRESTART}
-  - ${CLOUDINITRM}
+#  - ${NETRESTART}
+#  - ${CLOUDINITRM}
+  - ping -c 10 224.0.0.1
+#  - puppet agent --test --environment homelab
 _EOF_
 
     { echo "instance-id: ${VMNAME}"; echo "local-hostname: ${VMNAME}"; } > $META_DATA
 
     outputn "Copying cloud image ($(basename ${IMAGE}))"
-    DISK=${VMNAME}.qcow2
-    cp $IMAGE $DISK && ok
-    if $RESIZE_DISK
-    then
-        outputn "Resizing the disk to $DISK_SIZE"
-        qemu-img create -f qcow2 \
-            -o preallocation=metadata $DISK.new $DISK_SIZE &>> ${VMNAME}.log \
-            && virt-resize --quiet --expand /dev/sda1 $DISK $DISK.new &>> ${VMNAME}.log \
-            && (mv $DISK.new $DISK && ok) \
-            || die "Could not resize disk."
-    fi
 
     # Create CD-ROM ISO with cloud-init config
     outputn "Generating ISO for cloud-init"
@@ -428,23 +451,62 @@ _EOF_
         && ok \
         || die "Could not generate ISO."
 
-    if [ "${VERBOSE}" -eq 1 ]
-    then
-        output "Creating storage pool with the following command"
-        printf "    virsh pool-create-as \\ \n"
-        printf "      --name ${VMNAME} \\ \n"
-        printf "      --type dir \\ \n"
-        printf "      --target ${IMAGEDIR}/${VMNAME} \n"
-    else
-        outputn "Creating storage pool"
-    fi
 
-    # Create new storage pool for new VM
-    (virsh pool-create-as \
-        --name ${VMNAME} \
-        --type dir \
-        --target ${IMAGEDIR}/${VMNAME} &>> ${VMNAME}.log && ok) \
-        || die "Could not create storage pool."
+    if $USE_LVM; then
+
+        if [ "${VERBOSE}" -eq 1 ]
+        then
+            output "Creating Logical Volume with the following command"
+            printf "    lvcreate -L ${DISK_SIZE} -n ${VMNAME} ${VOLGROUP} \\ \n"
+        else
+            outputn "Creating Logical Volume"
+        fi
+        (lvcreate -L ${DISK_SIZE} -n ${VMNAME} ${VOLGROUP} && ok) \
+          || die "Could not create Logical volume."
+
+        output "Writing image to logical volume"
+        
+        DEVICE="/dev/${VOLGROUP}/${VMNAME}"
+
+        (dd if=${IMAGEDIR}/${IMAGE} of=${DEVICE} bs=1M &>> ${VMNAME}.log && ok) \
+          || die "Could not write image to Logical volume."
+
+        DISK="${DEVICE},format=raw,bus=virtio"
+    else
+        if [ "${VERBOSE}" -eq 1 ]
+        then
+            output "Creating storage pool with the following command"
+            printf "    virsh pool-create-as \\ \n"
+            printf "      --name ${VMNAME} \\ \n"
+            printf "      --type dir \\ \n"
+            printf "      --target ${IMAGEDIR}/${VMNAME} \n"
+        else
+            outputn "Creating storage pool"
+        fi
+
+        DISK=${VMNAME}.qcow2
+        cp $IMAGE $DISK && ok
+        if $RESIZE_DISK
+        then
+            outputn "Resizing the disk to $DISK_SIZE"
+            qemu-img create -f qcow2 \
+                -o preallocation=metadata $DISK.new $DISK_SIZE &>> ${VMNAME}.log \
+                && virt-resize --quiet --expand /dev/sda1 $DISK $DISK.new &>> ${VMNAME}.log \
+                && (mv $DISK.new $DISK && ok) \
+                || die "Could not resize disk."
+        fi
+    
+    
+        # Create new storage pool for new VM
+        (virsh pool-create-as \
+            --name ${VMNAME} \
+            --type dir \
+            --target ${IMAGEDIR}/${VMNAME} &>> ${VMNAME}.log && ok) \
+            || die "Could not create storage pool."
+
+        DISK="${DISK},format=qcow2,bus=virtio"
+
+    fi
 
     # Add custom MAC Address if specified
     if [ -z "${MACADDRESS}" ]
@@ -463,7 +525,7 @@ _EOF_
         printf "      --memory ${MEMORY} \\ \n"
         printf "      --vcpus ${CPUS} \\ \n"
         printf "      --cpu ${FEATURE} \\ \n"
-        printf "      --disk ${DISK},format=qcow2,bus=virtio \\ \n"
+        printf "      --disk ${DISK} \\ \n"
         printf "      --disk ${CI_ISO},device=cdrom \\ \n"
         printf "      --network ${NETWORK_PARAMS} \\ \n"
         printf "      --os-type=linux \\ \n"
@@ -527,9 +589,11 @@ _EOF_
 function remove ()
 {
     # Parse command line arguments
-    while getopts ":hv" opt
+    while getopts ":V:L:hv" opt
     do
         case "$opt" in
+            V ) VOLGROUP="${OPTARG}" ;;
+            L ) USE_LVM="${OPTARG}" ;;
             v ) VERBOSE=1 ;;
             h ) usage ;;
             * ) die "Unsupported option. Run 'kvm-install-vm help remove'." ;;
@@ -569,6 +633,8 @@ function set_defaults ()
     DISTRO=centos7                  # Distribution
     MACADDRESS=""                   # MAC Address
     TIMEZONE=US/Eastern             # Timezone
+    USE_LVM=true                    # Use LVM for the disk
+    VOLGROUP=vms                    # Use LVM for the disk
     VERBOSE=0                       # Verbosity
 
     # Reset OPTIND
@@ -587,7 +653,7 @@ function set_custom_defaults ()
 function create ()
 {
     # Parse command line arguments
-    while getopts ":b:c:d:D:f:i:k:l:m:M:t:T:hv" opt
+    while getopts ":b:c:d:D:f:i:k:l:L:m:M:t:T:V:hv" opt
     do
         case "$opt" in
             b ) BRIDGE="${OPTARG}" ;;
@@ -598,10 +664,12 @@ function create ()
             i ) IMAGE="${OPTARG}" ;;
             k ) PUBKEY="${OPTARG}" ;;
             l ) IMAGEDIR="${OPTARG}" ;;
+            L ) USE_LVM="${OPTARG}" ;;
             m ) MEMORY="${OPTARG}" ;;
             M ) MACADDRESS="${OPTARG}" ;;
             t ) DISTRO="${OPTARG}" ;;
             T ) TIMEZONE="${OPTARG}" ;;
+            V ) VOLGROUP=${OPTARG} ;;
             v ) VERBOSE=1 ;;
             h ) usage ;;
             * ) die "Unsupported option. Run 'kvm-install-vm help create'." ;;
@@ -640,7 +708,7 @@ function create ()
     then
         output "Using custom QCOW2 image: ${IMAGE}."
         OS_VARIANT="auto"
-        LOGIN_USER="<use the default account in your custom image>"
+        LOGIN_USER="ubuntu"
     else
         fetch_images
     fi
