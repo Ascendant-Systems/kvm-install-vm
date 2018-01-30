@@ -419,6 +419,7 @@ write_files:
     content: |
       env=dev
       role=${VMNAME}
+      puppetenv=homelab
       location=home
   - path: /etc/custom/misc/user-data-vars.sh
     content: |
