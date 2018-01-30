@@ -628,7 +628,7 @@ function set_defaults ()
     PUBKEY=${HOME}/.ssh/id_rsa.pub  # SSH public key
     DISTRO=centos7                  # Distribution
     MACADDRESS=""                   # MAC Address
-    TIMEZONE=US/Eastern             # Timezone
+    TIMEZONE=Africa/Johannesburg    # Timezone
     USE_LVM=true                    # Use LVM for the disk
     VOLGROUP=vms                    # Use LVM for the disk
     VERBOSE=0                       # Verbosity
